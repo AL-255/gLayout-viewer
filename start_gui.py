@@ -52,12 +52,17 @@ from discovery import (  # noqa: E402
     underlying_types,
 )
 from gds_viewer import render_gds  # noqa: E402
+import pdk_check  # noqa: E402
 from themes import THEMES, Theme, get_theme  # noqa: E402
 
 OUT_DIR = _HERE.parent / "out"
 DEFAULT_LAYOUT_FILE = _HERE / "default_layout.json"
 _LEGACY_LAYOUT_FILE = _HERE / "default_layout.bin"
-_LAYOUT_FORMAT_VERSION = 1
+# Version 2: log moved out of BottomDockWidgetArea into the LEFT area as a
+# vertical sibling of cells/params/preview. v1 blobs would re-pin the log to
+# the bottom area on restore, which silently brings back the one-way-resize
+# bug -- so they are dropped on load and the v2 default is rewritten.
+_LAYOUT_FORMAT_VERSION = 2
 _SENTINEL = object()
 _DEFAULT_THEME = "Fusion light"
 
@@ -243,6 +248,14 @@ class GeneratorWorker(_Worker):
 
 
 class DrcWorker(_Worker):
+    """Run DRC by reading the rule deck out of $PDKPATH directly.
+
+    The bundled MappedPDK.drc() entry-points point at .lydrc shims that
+    %include rule decks from a path that doesn't ship in this repo, so
+    they abort before opening the GDS. pdk_check.run_drc bypasses them
+    and invokes klayout against the PDK install's main.drc.
+    """
+
     def __init__(self, pdk: Any, gds: Path, out_dir: Path) -> None:
         super().__init__()
         self.pdk = pdk
@@ -252,23 +265,24 @@ class DrcWorker(_Worker):
     @QtCore.Slot()
     def run(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        captured = io.StringIO()
-        clean = None
         try:
-            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-                clean = self.pdk.drc(self.gds, output_dir_or_file=self.out_dir)
+            clean, report_path, log = pdk_check.run_drc(
+                self.pdk, self.gds, self.out_dir
+            )
         except Exception as exc:
-            text = captured.getvalue() + f"\n\n!! DRC raised: {exc}\n" + traceback.format_exc()
-            self.text_out.emit("drc", text)
+            self.text_out.emit("drc", f"!! DRC raised: {exc}\n" + traceback.format_exc())
             self.finished.emit(False, f"DRC error: {exc}")
             return
         verdict = "CLEAN" if clean else "VIOLATIONS"
-        head = f"DRC verdict: {verdict}\nreport dir: {self.out_dir}\n\n"
-        self.text_out.emit("drc", head + captured.getvalue())
+        head = f"DRC verdict: {verdict}\nreport: {report_path}\n\n"
+        self.text_out.emit("drc", head + log)
         self.finished.emit(bool(clean), f"DRC {verdict.lower()}")
 
 
 class LvsWorker(_Worker):
+    """Run LVS through pdk_check, which forces variant-correct setup files
+    and shims the netgen launcher around its dash-incompatibility."""
+
     def __init__(self, pdk: Any, gds: Path, spice: Path,
                  design_name: str, pdk_root: str) -> None:
         super().__init__()
@@ -276,33 +290,173 @@ class LvsWorker(_Worker):
         self.gds = gds
         self.spice = spice
         self.design_name = design_name
-        self.pdk_root = pdk_root
+        self.pdk_root = pdk_root  # accepted for compat; pdk_check resolves it
 
     @QtCore.Slot()
     def run(self) -> None:
-        captured = io.StringIO()
-        result: Any = None
+        out_dir = self.gds.parent / "lvs"
         try:
-            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-                result = self.pdk.lvs_netgen(
-                    layout=self.gds,
-                    design_name=self.design_name,
-                    pdk_root=self.pdk_root,
-                    netlist=self.spice,
-                )
+            success, _report, log = pdk_check.run_lvs(
+                self.pdk, self.gds, self.spice, self.design_name, out_dir
+            )
         except Exception as exc:
-            text = captured.getvalue() + f"\n\n!! LVS raised: {exc}\n" + traceback.format_exc()
-            self.text_out.emit("lvs", text)
+            self.text_out.emit("lvs", f"!! LVS raised: {exc}\n" + traceback.format_exc())
             self.finished.emit(False, f"LVS error: {exc}")
             return
-        head = f"LVS result:\n{result!r}\n\n"
-        self.text_out.emit("lvs", head + captured.getvalue())
-        success = True
-        if isinstance(result, dict):
-            code = result.get("code") or result.get("return_code")
-            if isinstance(code, int) and code != 0:
-                success = False
-        self.finished.emit(success, "LVS done" if success else "LVS mismatch")
+        self.text_out.emit("lvs", log)
+        self.finished.emit(success, "LVS match" if success else "LVS mismatch")
+
+
+# ---------------------------------------------------------------------------
+# env settings dialog
+
+# Tool option lists. Currently single-entry but the combo boxes are wired up
+# so dropping additional backends in (e.g. klayout-LVS, magic-DRC) only needs
+# new strings here plus matching wiring in the run_drc / run_lvs paths.
+_DRC_TOOLS = ("klayout",)
+_LVS_TOOLS = ("magic+netgen",)
+
+
+def _detect_env_defaults() -> dict[str, str]:
+    """Resolve env-settings fields from the current shell environment.
+
+    Used as the source of placeholder text in the dialog (so the user can see
+    what the app *would* use for empty fields) and as the fallback at apply
+    time. Values come straight from os.environ / shutil.which on the as-
+    launched PATH; we do NOT bake these into QSettings -- that would pin
+    machine-specific paths into the user's persisted config.
+    """
+    return {
+        "pdk_root": os.environ.get("PDK_ROOT", ""),
+        "klayout_path": shutil.which("klayout") or "",
+        "magic_path": shutil.which("magic") or "",
+        "netgen_path": shutil.which("netgen") or "",
+    }
+
+
+class EnvSettingsDialog(QtWidgets.QDialog):
+    """Edit DRC/LVS-related environment paths and tool selection."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        current: dict[str, str],
+        detected: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Env settings")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        detected = detected or {}
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+
+        self.pdk_root_edit = self._add_path_row(
+            form, "PDK_ROOT:", current.get("pdk_root", ""),
+            placeholder=detected.get("pdk_root", ""), pick_dir=True,
+        )
+
+        form.addRow(self._section_label("DRC"))
+        self.drc_tool_combo = QtWidgets.QComboBox()
+        self.drc_tool_combo.addItems(_DRC_TOOLS)
+        i = self.drc_tool_combo.findText(current.get("drc_tool", _DRC_TOOLS[0]))
+        self.drc_tool_combo.setCurrentIndex(i if i >= 0 else 0)
+        form.addRow("DRC tool:", self.drc_tool_combo)
+        self.klayout_edit = self._add_path_row(
+            form, "klayout binary:", current.get("klayout_path", ""),
+            placeholder=detected.get("klayout_path", ""), pick_dir=False,
+        )
+
+        form.addRow(self._section_label("LVS"))
+        self.lvs_tool_combo = QtWidgets.QComboBox()
+        self.lvs_tool_combo.addItems(_LVS_TOOLS)
+        i = self.lvs_tool_combo.findText(current.get("lvs_tool", _LVS_TOOLS[0]))
+        self.lvs_tool_combo.setCurrentIndex(i if i >= 0 else 0)
+        form.addRow("LVS tool:", self.lvs_tool_combo)
+        self.magic_edit = self._add_path_row(
+            form, "magic binary:", current.get("magic_path", ""),
+            placeholder=detected.get("magic_path", ""), pick_dir=False,
+        )
+        self.netgen_edit = self._add_path_row(
+            form, "netgen binary:", current.get("netgen_path", ""),
+            placeholder=detected.get("netgen_path", ""), pick_dir=False,
+        )
+
+        hint = QtWidgets.QLabel(
+            "Greyed-out values are detected from the shell environment "
+            "(PDK_ROOT, PATH lookups). Leaving a field empty keeps that "
+            "auto-detected value; type to override."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: palette(placeholder-text); padding-top: 4px;")
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addLayout(form)
+        v.addWidget(hint)
+        v.addWidget(buttons)
+
+    def _add_path_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        value: str,
+        *,
+        pick_dir: bool,
+        placeholder: str = "",
+    ) -> QtWidgets.QLineEdit:
+        edit = QtWidgets.QLineEdit(value)
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        browse = QtWidgets.QPushButton("Browse...")
+        browse.setAutoDefault(False)
+        browse.clicked.connect(lambda: self._on_browse(edit, pick_dir))
+        host = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(host)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(edit, 1)
+        h.addWidget(browse, 0)
+        form.addRow(label, host)
+        return edit
+
+    def _on_browse(self, edit: QtWidgets.QLineEdit, pick_dir: bool) -> None:
+        start = edit.text().strip() or os.path.expanduser("~")
+        if pick_dir:
+            picked = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select directory", start
+            )
+        else:
+            picked, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select binary", start
+            )
+        if picked:
+            edit.setText(picked)
+
+    @staticmethod
+    def _section_label(text: str) -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel(text)
+        f = lbl.font()
+        f.setBold(True)
+        lbl.setFont(f)
+        lbl.setStyleSheet("padding-top: 6px;")
+        return lbl
+
+    def values(self) -> dict[str, str]:
+        return {
+            "pdk_root": self.pdk_root_edit.text().strip(),
+            "drc_tool": self.drc_tool_combo.currentText(),
+            "klayout_path": self.klayout_edit.text().strip(),
+            "lvs_tool": self.lvs_tool_combo.currentText(),
+            "magic_path": self.magic_edit.text().strip(),
+            "netgen_path": self.netgen_edit.text().strip(),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +500,12 @@ class PcellMenu(QtWidgets.QMainWindow):
         )
         self._theme_actions: dict[str, QtGui.QAction] = {}
         self._theme_default_style: str = ""
+
+        # Env settings (PDK_ROOT, DRC/LVS tool paths) live in QSettings and
+        # are pushed into os.environ early so PDK discovery sees the user's
+        # configured PDK_ROOT instead of whatever the launch shell exported.
+        self._env_settings: dict[str, str] = self._load_env_settings()
+        self._apply_env_settings()
 
         # Dock widgets, in left-to-right / top-to-bottom default order so the
         # "Reset layout" entry can rebuild the initial arrangement.
@@ -624,15 +784,17 @@ class PcellMenu(QtWidgets.QMainWindow):
         lvs = self._docks["lvs"]
         log = self._docks["log"]
 
-        # Bottom strip belongs entirely to the log dock; claim the bottom
-        # corners so the log stretches edge-to-edge.
-        self.setCorner(QtCore.Qt.BottomLeftCorner, QtCore.Qt.BottomDockWidgetArea)
-        self.setCorner(QtCore.Qt.BottomRightCorner, QtCore.Qt.BottomDockWidgetArea)
-
-        # Top row across the rest of the window: cells | params | (tab group
-        # with preview/drc/lvs). Place them in the left dock area and split
-        # left-to-right so they form three columns.
+        # Layout strategy: a single nested-split tree rooted in the LEFT dock
+        # area. Top row is cells | params | (preview tabbed with drc/lvs);
+        # log sits below as a horizontally-spanning sibling. We deliberately
+        # avoid BottomDockWidgetArea here because, with no central widget,
+        # Qt's QMainWindow lets you drag the inter-area separator one way
+        # only -- the bottom dock can be grown but not shrunk past its
+        # initial size. Routing log through splitDockWidget instead puts the
+        # divider on a regular QSplitter handle, which resizes both ways.
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, cells)
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, log)
+        self.splitDockWidget(cells, log, QtCore.Qt.Vertical)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, params)
         self.splitDockWidget(cells, params, QtCore.Qt.Horizontal)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, preview)
@@ -641,10 +803,6 @@ class PcellMenu(QtWidgets.QMainWindow):
         self.tabifyDockWidget(preview, drc)
         self.tabifyDockWidget(preview, lvs)
         preview.raise_()  # preview is the default visible tab
-
-        # Log is anchored at the bottom and not allowed to leave that area.
-        log.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, log)
 
         # Reasonable initial sizes.
         self.resizeDocks([cells, params, preview], [240, 460, 700], QtCore.Qt.Horizontal)
@@ -675,6 +833,14 @@ class PcellMenu(QtWidgets.QMainWindow):
         panels_menu.addAction(reset_action)
 
         view_menu.addSeparator()
+
+        tools_menu = bar.addMenu("&Tools")
+        env_action = QtGui.QAction("Env settings...", self)
+        env_action.setStatusTip(
+            "Configure PDK_ROOT and DRC/LVS tool paths"
+        )
+        env_action.triggered.connect(self._open_env_settings)
+        tools_menu.addAction(env_action)
 
         theme_menu = view_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
@@ -821,7 +987,11 @@ class PcellMenu(QtWidgets.QMainWindow):
             payload = json.loads(text)
         except json.JSONDecodeError:
             return None
-        b64 = payload.get("qstate_b64") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != _LAYOUT_FORMAT_VERSION:
+            return None
+        b64 = payload.get("qstate_b64")
         if not isinstance(b64, str):
             return None
         try:
@@ -882,6 +1052,97 @@ class PcellMenu(QtWidgets.QMainWindow):
                 self._log(
                     f"warning: reset could not load {DEFAULT_LAYOUT_FILE.name}"
                 )
+
+    # ----- env settings ---------------------------------------------------
+    _ENV_KEYS: tuple[tuple[str, str], ...] = (
+        ("pdk_root", ""),
+        ("drc_tool", "klayout"),
+        ("klayout_path", ""),
+        ("lvs_tool", "magic+netgen"),
+        ("magic_path", ""),
+        ("netgen_path", ""),
+    )
+
+    def _load_env_settings(self) -> dict[str, str]:
+        return {
+            key: self._settings.value(f"env/{key}", default, type=str)
+            for key, default in self._ENV_KEYS
+        }
+
+    def _save_env_settings(self) -> None:
+        for key, _ in self._ENV_KEYS:
+            self._settings.setValue(f"env/{key}", self._env_settings.get(key, ""))
+
+    def _apply_env_settings(self) -> None:
+        # Snapshot the as-launched environment once so successive applies
+        # rebuild from a clean baseline instead of accreting prefixes. The
+        # detected defaults are captured against this baseline so the dialog
+        # always shows the *shell* values, not whatever the user previously
+        # forced via overrides.
+        if not hasattr(self, "_baseline_path"):
+            self._baseline_path = os.environ.get("PATH", "")
+            self._baseline_pdk_root = os.environ.get("PDK_ROOT", "")
+            self._baseline_cad_root = os.environ.get("CAD_ROOT", "")
+            self._detected_env: dict[str, str] = _detect_env_defaults()
+
+        pdk_root = self._env_settings.get("pdk_root", "").strip()
+        if pdk_root:
+            os.environ["PDK_ROOT"] = pdk_root
+        elif self._baseline_pdk_root:
+            os.environ["PDK_ROOT"] = self._baseline_pdk_root
+        else:
+            os.environ.pop("PDK_ROOT", None)
+
+        extra_dirs: list[str] = []
+        for key in ("klayout_path", "magic_path", "netgen_path"):
+            p = self._env_settings.get(key, "").strip()
+            if not p:
+                continue
+            d = str(Path(p).expanduser().parent)
+            if d and d not in extra_dirs:
+                extra_dirs.append(d)
+        if extra_dirs:
+            prefix = os.pathsep.join(extra_dirs)
+            os.environ["PATH"] = (
+                prefix + os.pathsep + self._baseline_path
+                if self._baseline_path else prefix
+            )
+        else:
+            os.environ["PATH"] = self._baseline_path
+
+        # Magic loads its tcl libs from $CAD_ROOT/magic/tcl, so a 8.3.411
+        # binary on PATH but $CAD_ROOT pointing at a 8.3.99 lib runs as
+        # 8.3.99 (the launcher script literally substitutes CAD_ROOT into
+        # the tcl path). Whenever the user pins a magic binary, derive
+        # CAD_ROOT from its sibling lib dir if that layout looks right;
+        # otherwise leave the as-launched value alone.
+        magic_path = self._env_settings.get("magic_path", "").strip()
+        new_cad_root = ""
+        if magic_path:
+            mp = Path(magic_path).expanduser().resolve()
+            candidate = mp.parent.parent / "lib"
+            if (candidate / "magic" / "tcl" / "magic.tcl").is_file():
+                new_cad_root = str(candidate)
+        if new_cad_root:
+            os.environ["CAD_ROOT"] = new_cad_root
+        elif self._baseline_cad_root:
+            os.environ["CAD_ROOT"] = self._baseline_cad_root
+        else:
+            os.environ.pop("CAD_ROOT", None)
+
+    def _open_env_settings(self) -> None:
+        dlg = EnvSettingsDialog(
+            self, dict(self._env_settings), dict(self._detected_env)
+        )
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new = dlg.values()
+        if new == self._env_settings:
+            return
+        self._env_settings = new
+        self._save_env_settings()
+        self._apply_env_settings()
+        self._log("env settings updated")
 
     # ----- catalogue load -------------------------------------------------
     def _initial_load(self) -> None:
@@ -1076,14 +1337,26 @@ class PcellMenu(QtWidgets.QMainWindow):
         self._last_pdk = payload["pdk"]
         self._last_pdk_name = payload["pdk_name"]
         self._last_design_name = payload["design_name"]
+        # artifacts and finished are two separate cross-thread queued
+        # signals; refresh here so the buttons end up correct regardless
+        # of which slot lands first in the main loop.
+        self._refresh_check_buttons()
         if self._last_gds is not None:
             self._render_preview(self._last_gds)
 
     def _after_generation(self, success: bool, msg: str) -> None:
         self._set_busy(False, ("ok: " if success else "error: ") + msg)
-        if success:
-            self.drc_btn.setEnabled(self._last_gds is not None)
-            self.lvs_btn.setEnabled(self._last_gds is not None and self._last_spice is not None)
+
+    def _refresh_check_buttons(self) -> None:
+        """Single source of truth for the DRC/LVS button enable state."""
+        if self._busy:
+            self.drc_btn.setEnabled(False)
+            self.lvs_btn.setEnabled(False)
+            return
+        self.drc_btn.setEnabled(self._last_gds is not None)
+        self.lvs_btn.setEnabled(
+            self._last_gds is not None and self._last_spice is not None
+        )
 
     def _render_preview(self, gds_path: Path) -> None:
         try:
@@ -1144,8 +1417,6 @@ class PcellMenu(QtWidgets.QMainWindow):
 
     def _after_check(self, success: bool, msg: str) -> None:
         self._set_busy(False, ("ok: " if success else "error: ") + msg)
-        self.drc_btn.setEnabled(self._last_gds is not None)
-        self.lvs_btn.setEnabled(self._last_gds is not None and self._last_spice is not None)
 
     # ----- worker plumbing ------------------------------------------------
     def _launch_worker(self, worker: _Worker, *, on_finished) -> None:
@@ -1179,10 +1450,9 @@ class PcellMenu(QtWidgets.QMainWindow):
         self._busy = busy
         if busy:
             self.gen_btn.setEnabled(False)
-            self.drc_btn.setEnabled(False)
-            self.lvs_btn.setEnabled(False)
         else:
             self.gen_btn.setEnabled(self._current is not None and bool(self._pdks))
+        self._refresh_check_buttons()
         self.status_lbl.setText(status_text)
 
     @QtCore.Slot(str)
