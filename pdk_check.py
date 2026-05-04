@@ -31,7 +31,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -155,14 +155,51 @@ def _count_drc_violations(report_path: Path) -> int:
     return sum(1 for _ in items.findall("item"))
 
 
+@contextlib.contextmanager
+def _track_subprocesses(callback: Callable[[subprocess.Popen | None], None] | None):
+    """Module-level wrapper around ``subprocess.Popen`` for the duration
+    of the with-block. Every Popen spawned in this thread (and any other
+    thread that happens to call subprocess.Popen during the window) is
+    routed through ``callback`` so the GUI's Cancel button can terminate
+    them. Restores the original Popen on exit.
+
+    The DRC/LVS dispatchers stay readable -- they call subprocess
+    normally; the wrapper hides the registration plumbing. ``pdk.lvs_netgen``
+    is bundled and we don't want to fork it just to add a hook, so this
+    interception strategy is the cheapest way to track its child procs
+    too.
+    """
+    if callback is None:
+        yield
+        return
+    orig = subprocess.Popen
+
+    class _TrackedPopen(orig):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            try:
+                callback(self)
+            except Exception:
+                pass
+
+    subprocess.Popen = _TrackedPopen  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        subprocess.Popen = orig
+
+
 def run_drc(
     pdk: Any, gds_path: Path, out_dir: Path,
     *, klayout_bin: str = "klayout",
+    on_proc: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> tuple[bool, Path, str]:
     """Run klayout DRC on ``gds_path`` using the PDK's stock rule deck.
 
     Returns ``(clean, report_path, log)``. ``clean`` is True when the
-    report XML has zero ``<item>`` entries.
+    report XML has zero ``<item>`` entries. If ``on_proc`` is given,
+    every subprocess spawned for this run is registered through it so
+    the caller can terminate them on cancel.
     """
     paths = resolve_pdk_paths(pdk.name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +214,8 @@ def run_drc(
     for k, v in paths.drc_vars.items():
         args.extend(["-rd", f"{k}={v}"])
 
-    proc = subprocess.run(args, capture_output=True, text=True)
+    with _track_subprocesses(on_proc):
+        proc = subprocess.run(args, capture_output=True, text=True)
     log = (
         f"$ {' '.join(args)}\n\n"
         f"-- stdout --\n{proc.stdout}\n"
@@ -279,6 +317,7 @@ def _netgen_shim(real_path: Path) -> Iterator[Path]:
 
 def run_lvs(
     pdk: Any, gds_path: Path, spice_path: Path, design_name: str, out_dir: Path,
+    *, on_proc: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> tuple[bool, Path | None, str]:
     """Run LVS the same way ``tests/lvs/run_cell_lvs.py`` does.
 
@@ -306,7 +345,8 @@ def run_lvs(
 
     saved_path = os.environ.get("PATH", "")
     try:
-        with _netgen_shim(Path(shutil.which("netgen"))) as shim_dir:
+        with _netgen_shim(Path(shutil.which("netgen"))) as shim_dir, \
+             _track_subprocesses(on_proc):
             os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved_path}"
             try:
                 ret = pdk.lvs_netgen(

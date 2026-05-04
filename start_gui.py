@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import traceback
 import typing
@@ -51,7 +52,7 @@ from discovery import (  # noqa: E402
     discover_pdks,
     underlying_types,
 )
-from gds_viewer import render_gds  # noqa: E402
+from gds_viewer import render_gds, parse_klayout_map  # noqa: E402
 import pdk_check  # noqa: E402
 from themes import THEMES, Theme, get_theme  # noqa: E402
 
@@ -127,9 +128,15 @@ def _coerce_to_component(obj: Any) -> Any:
     a fresh Component so callers can ``write_gds`` it.
 
     Several generators in the repo annotate ``-> Component`` but actually
-    return a ``ComponentReference`` (e.g. ``diff_pair_ibias``). The wrapper
-    preserves ports and the ``info["netlist"]`` payload.
+    return a ``ComponentReference`` (e.g. ``diff_pair_ibias``) or a tuple
+    whose first element is the top-level Component plus a few helper refs
+    (e.g. ``diff_pair_stackedcmirror`` returns
+    ``(toplevel, drain_routeref, gate_routeref, c_ref)``). Pull the first
+    element out and recurse so the rest of the GUI sees a single object
+    with ``write_gds``/``info["netlist"]``.
     """
+    if isinstance(obj, tuple) and obj:
+        return _coerce_to_component(obj[0])
     if hasattr(obj, "write_gds"):
         return obj
     try:
@@ -162,6 +169,39 @@ def _initial_text(p: ParamInfo) -> str:
     return repr(p.default)
 
 
+def _placeholder_for(p: ParamInfo) -> str:
+    """Sample value to show as greyed text in an empty required field.
+
+    The bare ``cannot parse '' as tuple[float, float, int]`` error a user
+    gets after clicking Generate is uninformative; surfacing an example
+    of the right shape inline makes it obvious what to type.
+    """
+    if p.has_default:
+        return ""
+    base, _ = underlying_types(p.annotation)
+    origin = typing.get_origin(base)
+    args = typing.get_args(base) if origin is not None else ()
+    if origin is tuple and args:
+        sample = []
+        for a in args:
+            if a is float:
+                sample.append("1.0")
+            elif a is int:
+                sample.append("1")
+            elif a is str:
+                sample.append('"x"')
+            elif a is bool:
+                sample.append("False")
+            else:
+                sample.append("0")
+        return "e.g. (" + ", ".join(sample) + ")"
+    if base is int:
+        return "e.g. 1"
+    if base is float:
+        return "e.g. 1.0"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # background workers — Qt's signal/slot is the right place to marshal results
 # back to the GUI thread.
@@ -174,6 +214,53 @@ class _Worker(QtCore.QObject):
 
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
+        # Subprocesses spawned by the worker, tracked so the GUI's Cancel
+        # button can terminate them. The list is mutated from the worker
+        # thread (register_proc) and the main thread (cancel), so it
+        # needs its own lock; QtCore.QMutex would also work but plain
+        # threading.Lock keeps the dependency footprint small.
+        import threading
+        self._cancel_lock = threading.Lock()
+        self._cancelled: bool = False
+        self._active_procs: list[subprocess.Popen] = []
+
+    def register_proc(self, proc: subprocess.Popen | None) -> None:
+        """Hand a freshly-spawned Popen to the worker so a subsequent
+        ``cancel()`` can terminate it. Pass ``None`` to garbage-collect
+        any procs that have since exited."""
+        with self._cancel_lock:
+            if proc is None:
+                self._active_procs = [p for p in self._active_procs if p.poll() is None]
+                return
+            self._active_procs.append(proc)
+            if self._cancelled:
+                # User cancelled before this proc was registered -- terminate
+                # it immediately so it doesn't run to completion in the gap.
+                self._terminate_locked(proc)
+
+    def cancel(self) -> None:
+        """Best-effort cancel: mark the worker cancelled and terminate any
+        subprocess it has registered. Pure-Python work (e.g. the
+        gdsfactory-heavy GeneratorWorker.run body) cannot be safely
+        interrupted from outside, so for those workers cancel only
+        prevents *future* subprocesses from running and lets the dialog
+        close; the worker thread itself keeps going until it returns."""
+        with self._cancel_lock:
+            self._cancelled = True
+            for p in list(self._active_procs):
+                self._terminate_locked(p)
+
+    @staticmethod
+    def _terminate_locked(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
 
 
 class GeneratorWorker(_Worker):
@@ -267,11 +354,16 @@ class DrcWorker(_Worker):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         try:
             clean, report_path, log = pdk_check.run_drc(
-                self.pdk, self.gds, self.out_dir
+                self.pdk, self.gds, self.out_dir,
+                on_proc=self.register_proc,
             )
         except Exception as exc:
             self.text_out.emit("drc", f"!! DRC raised: {exc}\n" + traceback.format_exc())
             self.finished.emit(False, f"DRC error: {exc}")
+            return
+        if self.cancelled:
+            self.text_out.emit("drc", log + "\n!! cancelled by user\n")
+            self.finished.emit(False, "DRC cancelled")
             return
         verdict = "CLEAN" if clean else "VIOLATIONS"
         head = f"DRC verdict: {verdict}\nreport: {report_path}\n\n"
@@ -297,11 +389,16 @@ class LvsWorker(_Worker):
         out_dir = self.gds.parent / "lvs"
         try:
             success, _report, log = pdk_check.run_lvs(
-                self.pdk, self.gds, self.spice, self.design_name, out_dir
+                self.pdk, self.gds, self.spice, self.design_name, out_dir,
+                on_proc=self.register_proc,
             )
         except Exception as exc:
             self.text_out.emit("lvs", f"!! LVS raised: {exc}\n" + traceback.format_exc())
             self.finished.emit(False, f"LVS error: {exc}")
+            return
+        if self.cancelled:
+            self.text_out.emit("lvs", log + "\n!! cancelled by user\n")
+            self.finished.emit(False, "LVS cancelled")
             return
         self.text_out.emit("lvs", log)
         self.finished.emit(success, "LVS match" if success else "LVS mismatch")
@@ -457,6 +554,150 @@ class EnvSettingsDialog(QtWidgets.QDialog):
             "magic_path": self.magic_edit.text().strip(),
             "netgen_path": self.netgen_edit.text().strip(),
         }
+
+
+# ---------------------------------------------------------------------------
+# about dialog
+
+# Drop the actual logo files into ./assets/ as either .png or .svg under
+# these stems and they show up in the About dialog automatically. Leave
+# them missing and the dialog falls back to text labels, so the build
+# stays self-contained when nobody's checked the binary assets in.
+_ASSET_DIR = _HERE / "assets"
+_LOGO_STEMS = (("Brown", "brown"), ("U-M", "umich"))
+_LOGO_EXTS = (".png", ".svg", ".jpg", ".jpeg")
+_LICENSE_FILE = _HERE / "LICENSE"
+
+
+def _find_logo(stem: str) -> Path | None:
+    for ext in _LOGO_EXTS:
+        cand = _ASSET_DIR / f"{stem}{ext}"
+        if cand.is_file():
+            return cand
+    return None
+
+
+class AboutDialog(QtWidgets.QDialog):
+    """About dialog with school logos, lab link, and author info."""
+
+    LAB_URL = "https://www.saliganelab.com/"
+    AUTHOR_NAME = "Anhang Li"
+    AUTHOR_EMAIL = "anhangli@umich.edu"
+    LOGO_HEIGHT = 96  # px, for both logos so they line up nicely
+
+    def __init__(self, parent: QtWidgets.QWidget | None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About")
+        self.setModal(True)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 16)
+        outer.setSpacing(14)
+
+        # Logos row.
+        logos = QtWidgets.QHBoxLayout()
+        logos.setSpacing(28)
+        logos.addStretch(1)
+        for fallback_text, stem in _LOGO_STEMS:
+            logos.addWidget(self._build_logo_widget(fallback_text, _find_logo(stem)))
+        logos.addStretch(1)
+        outer.addLayout(logos)
+
+        # App / lab info.
+        title = QtWidgets.QLabel("gLayout Viewer")
+        f = title.font()
+        f.setPointSize(f.pointSize() + 3)
+        f.setBold(True)
+        title.setFont(f)
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        outer.addWidget(title)
+
+        lab = QtWidgets.QLabel(
+            f'<p align="center">'
+            f'This utility is part of the gLayout project at <a href="{self.LAB_URL}">Saligane Lab</a>'
+            f"</p>"
+        )
+        lab.setOpenExternalLinks(True)
+        lab.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        outer.addWidget(lab)
+
+        author = QtWidgets.QLabel(
+            f'<p align="center">'
+            f"Coded by {self.AUTHOR_NAME} "
+            f'(<a href="mailto:{self.AUTHOR_EMAIL}">{self.AUTHOR_EMAIL}</a>)'
+            f"</p>"
+        )
+        author.setOpenExternalLinks(True)
+        author.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        outer.addWidget(author)
+
+        # License section -- scrollable, read-only, monospaced. Loaded
+        # straight from ./LICENSE so the dialog stays in sync if the
+        # licence text is ever updated (no re-paste here required).
+        license_label = QtWidgets.QLabel("License")
+        f = license_label.font()
+        f.setBold(True)
+        license_label.setFont(f)
+        outer.addWidget(license_label)
+
+        license_view = QtWidgets.QPlainTextEdit()
+        license_view.setReadOnly(True)
+        license_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        license_view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        license_view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        mono = QtGui.QFont("Monospace")
+        mono.setStyleHint(QtGui.QFont.TypeWriter)
+        license_view.setFont(mono)
+        license_view.setMinimumHeight(180)
+        try:
+            license_view.setPlainText(_LICENSE_FILE.read_text())
+        except OSError as exc:
+            license_view.setPlainText(f"(could not read {_LICENSE_FILE}: {exc})")
+        outer.addWidget(license_view, stretch=1)
+
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        outer.addWidget(bb)
+
+        # Sized so the licence text gets a comfortable read; user can resize.
+        self.resize(560, 600)
+
+    def _build_logo_widget(self, fallback_text: str, path: Path | None) -> QtWidgets.QWidget:
+        """Return a QLabel showing the logo if found, else a styled text
+        placeholder so the layout stays coherent until someone drops the
+        real image into ./assets/."""
+        lbl = QtWidgets.QLabel()
+        lbl.setAlignment(QtCore.Qt.AlignCenter)
+        lbl.setFixedHeight(self.LOGO_HEIGHT)
+        if path is not None:
+            pix = QtGui.QPixmap(str(path))
+            if not pix.isNull():
+                lbl.setPixmap(
+                    pix.scaledToHeight(
+                        self.LOGO_HEIGHT, QtCore.Qt.SmoothTransformation
+                    )
+                )
+                lbl.setToolTip(str(path))
+                return lbl
+        # fallback
+        lbl.setText(fallback_text)
+        f = lbl.font()
+        f.setPointSize(f.pointSize() + 6)
+        f.setBold(True)
+        lbl.setFont(f)
+        lbl.setStyleSheet(
+            "QLabel {"
+            "  border: 1px dashed palette(mid);"
+            "  padding: 12px 24px;"
+            "  color: palette(placeholder-text);"
+            "}"
+        )
+        lbl.setToolTip(
+            f"drop {fallback_text} logo at "
+            f"{(_ASSET_DIR / _LOGO_STEMS[0 if fallback_text == _LOGO_STEMS[0][0] else 1][1]).with_suffix('.png')}"
+        )
+        return lbl
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +858,15 @@ class PcellMenu(QtWidgets.QMainWindow):
         self.lvs_btn.clicked.connect(self._on_run_lvs)
         tb.addWidget(self.lvs_btn)
 
+        self.klayout_btn = QtWidgets.QPushButton("Open in KLayout")
+        self.klayout_btn.setToolTip(
+            "Launch klayout -e on the last generated GDS, with KLAYOUT_PATH "
+            "pointing at the PDK's libs.tech/klayout"
+        )
+        self.klayout_btn.setEnabled(False)
+        self.klayout_btn.clicked.connect(self._on_open_klayout)
+        tb.addWidget(self.klayout_btn)
+
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
@@ -673,12 +923,32 @@ class PcellMenu(QtWidgets.QMainWindow):
         )
         self.preview_status.setStyleSheet("color:#555")
         v.addWidget(self.preview_status)
+
+        # Toolbar row: native matplotlib nav + a "show layer names" toggle.
+        # Names come from the PDK's klayout .map file -- read on demand and
+        # cached per PDK in self._layer_name_maps.
+        toolrow = QtWidgets.QWidget()
+        th = QtWidgets.QHBoxLayout(toolrow)
+        th.setContentsMargins(0, 0, 0, 0)
         self.preview_fig = Figure(figsize=(6.0, 4.5), dpi=110)
         self.preview_canvas = FigureCanvasQTAgg(self.preview_fig)
         self.preview_toolbar = NavigationToolbar2QT(self.preview_canvas, body)
-        v.addWidget(self.preview_toolbar)
+        th.addWidget(self.preview_toolbar, stretch=1)
+        self.preview_show_layer_names = QtWidgets.QCheckBox("Show layer names")
+        self.preview_show_layer_names.setToolTip(
+            "Annotate the legend with PDK layer names from "
+            "$PDK_ROOT/<variant>/libs.tech/klayout/tech/*.map"
+        )
+        self.preview_show_layer_names.toggled.connect(self._on_layer_name_toggle)
+        th.addWidget(self.preview_show_layer_names, stretch=0)
+        v.addWidget(toolrow)
+
         v.addWidget(self.preview_canvas, stretch=1)
         self._install_preview_interactions()
+
+        # Per-PDK lookup, lazily populated. Empty dict means "tried, found
+        # nothing"; missing key means "haven't tried yet".
+        self._layer_name_maps: dict[str, dict[tuple[int, int], str]] = {}
         return body
 
     # --- direct pan/zoom interactions on the preview canvas -------------
@@ -842,6 +1112,12 @@ class PcellMenu(QtWidgets.QMainWindow):
         env_action.triggered.connect(self._open_env_settings)
         tools_menu.addAction(env_action)
 
+        help_menu = bar.addMenu("&Help")
+        about_action = QtGui.QAction("About", self)
+        about_action.setStatusTip("About this application")
+        about_action.triggered.connect(self._open_about)
+        help_menu.addAction(about_action)
+
         theme_menu = view_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
         group.setExclusive(True)
@@ -852,6 +1128,9 @@ class PcellMenu(QtWidgets.QMainWindow):
             group.addAction(action)
             theme_menu.addAction(action)
             self._theme_actions[theme.name] = action
+
+    def _open_about(self) -> None:
+        AboutDialog(self).exec()
 
     def _on_theme_chosen(self, theme: Theme) -> None:
         self._current_theme = theme
@@ -1146,6 +1425,25 @@ class PcellMenu(QtWidgets.QMainWindow):
 
     # ----- catalogue load -------------------------------------------------
     def _initial_load(self) -> None:
+        # Drop every cached glayout.* module so importlib re-reads the
+        # source from disk -- otherwise edits the user just made never
+        # take effect (sys.modules cache wins). The previously-discovered
+        # generator funcs / PDK objects belong to the modules we're about
+        # to evict, so clear the "_last_*" state too; leaving stale refs
+        # would let DRC/LVS run against half-unloaded modules.
+        purged = [n for n in list(sys.modules) if n == "glayout" or n.startswith("glayout.")]
+        for name in purged:
+            sys.modules.pop(name, None)
+        if purged:
+            self._log(f"reload: evicted {len(purged)} cached glayout module(s)")
+        self._last_comp = None
+        self._last_gds = None
+        self._last_spice = None
+        self._last_pdk = None
+        self._last_pdk_name = ""
+        self._last_design_name = ""
+        self._current = None
+
         self._log("Discovering pcells...")
         try:
             self._generators = discover_generators()
@@ -1179,6 +1477,21 @@ class PcellMenu(QtWidgets.QMainWindow):
                 child = QtWidgets.QTreeWidgetItem(top_item, [g.name])
                 child.setData(0, QtCore.Qt.UserRole, (g.category, g.name))
         self.tree.expandAll()
+
+        # The param panel and check buttons reference the now-evicted
+        # generator/PDK objects; wipe them so the user starts from a
+        # clean slate after reload.
+        self.title_lbl.setText("(select a cell on the left)")
+        self.module_lbl.setText("")
+        while self.param_layout.count():
+            child = self.param_layout.takeAt(0)
+            w = child.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._param_rows.clear()
+        self.gen_btn.setEnabled(False)
+        self._refresh_check_buttons()
 
     # ----- selection ------------------------------------------------------
     def _on_select(self) -> None:
@@ -1240,6 +1553,7 @@ class PcellMenu(QtWidgets.QMainWindow):
         self.gen_btn.setEnabled(bool(self._pdks))
         self.drc_btn.setEnabled(False)
         self.lvs_btn.setEnabled(False)
+        self.klayout_btn.setEnabled(False)
 
     def _build_param_row(self, p: ParamInfo) -> QtWidgets.QWidget:
         row = QtWidgets.QWidget()
@@ -1270,6 +1584,9 @@ class PcellMenu(QtWidgets.QMainWindow):
         else:
             entry = QtWidgets.QLineEdit(_initial_text(p))
             entry.setMinimumWidth(320)
+            hint = _placeholder_for(p)
+            if hint:
+                entry.setPlaceholderText(hint)
             widget = entry
         h.addWidget(widget)
 
@@ -1348,19 +1665,63 @@ class PcellMenu(QtWidgets.QMainWindow):
         self._set_busy(False, ("ok: " if success else "error: ") + msg)
 
     def _refresh_check_buttons(self) -> None:
-        """Single source of truth for the DRC/LVS button enable state."""
+        """Single source of truth for the DRC/LVS/KLayout button enable state."""
         if self._busy:
             self.drc_btn.setEnabled(False)
             self.lvs_btn.setEnabled(False)
+            self.klayout_btn.setEnabled(False)
             return
         self.drc_btn.setEnabled(self._last_gds is not None)
         self.lvs_btn.setEnabled(
             self._last_gds is not None and self._last_spice is not None
         )
+        self.klayout_btn.setEnabled(self._last_gds is not None)
+
+    def _on_open_klayout(self) -> None:
+        """Spawn ``klayout -e <gds>`` with KLAYOUT_PATH pinned at the PDK
+        variant so klayout loads the right tech, layer view, and macros."""
+        if self._last_gds is None:
+            return
+        if not shutil.which("klayout"):
+            QtWidgets.QMessageBox.critical(
+                self, "klayout missing",
+                "klayout is not on PATH. Configure it under Tools -> Env settings.",
+            )
+            return
+        env = os.environ.copy()
+        variant = self._PDK_LAYER_MAP_VARIANT.get(self._last_pdk_name)
+        pdk_root = env.get("PDK_ROOT", "").strip()
+        if variant and pdk_root:
+            klayout_path = Path(pdk_root).expanduser() / variant / "libs.tech" / "klayout"
+            if klayout_path.is_dir():
+                env["KLAYOUT_PATH"] = str(klayout_path)
+                self._log(f"KLAYOUT_PATH={klayout_path}")
+            else:
+                self._log(
+                    f"warning: {klayout_path} does not exist; "
+                    "launching klayout without KLAYOUT_PATH override"
+                )
+        try:
+            # Detach so the GUI doesn't block / inherit klayout's lifetime.
+            subprocess.Popen(
+                ["klayout", "-e", str(self._last_gds)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._log(f"launched: klayout -e {self._last_gds}")
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "klayout launch failed", f"could not start klayout: {exc}",
+            )
 
     def _render_preview(self, gds_path: Path) -> None:
+        layer_names = None
+        if self.preview_show_layer_names.isChecked():
+            layer_names = self._layer_names_for(self._last_pdk_name)
         try:
-            summary = render_gds(gds_path, self.preview_fig)
+            summary = render_gds(gds_path, self.preview_fig, layer_names=layer_names)
         except Exception as exc:
             self.preview_status.setText(f"render failed: {exc}")
             self._log(f"!! preview render failed: {exc}")
@@ -1369,6 +1730,48 @@ class PcellMenu(QtWidgets.QMainWindow):
         self._apply_theme(self._current_theme)
         self.preview_canvas.draw_idle()
         self.preview_status.setText(f"{gds_path.name} — {summary}")
+
+    # Per-PDK variant directory under $PDK_ROOT that contains the klayout
+    # .map file. Mirrors pdk_check._PDK_CONFIGS so a user-configured
+    # PDK_ROOT line up with what the DRC/LVS dispatcher uses.
+    _PDK_LAYER_MAP_VARIANT: dict[str, str] = {
+        "sky130": "sky130B",
+        "gf180":  "gf180mcuC",
+        "ihp130": "ihp130",
+    }
+
+    def _layer_names_for(self, pdk_name: str) -> dict[tuple[int, int], str]:
+        """Lazy-load the klayout layer map for ``pdk_name`` from PDK_ROOT.
+
+        Returns ``{}`` and logs a one-line warning if the file is missing
+        so the legend silently falls back to bare layer/dt numbers rather
+        than blowing up the preview.
+        """
+        if pdk_name in self._layer_name_maps:
+            return self._layer_name_maps[pdk_name]
+        variant = self._PDK_LAYER_MAP_VARIANT.get(pdk_name)
+        pdk_root = os.environ.get("PDK_ROOT", "").strip()
+        result: dict[tuple[int, int], str] = {}
+        if variant and pdk_root:
+            tech_dir = Path(pdk_root).expanduser() / variant / "libs.tech" / "klayout" / "tech"
+            map_files = sorted(tech_dir.glob("*.map"))
+            if not map_files:
+                self._log(f"layer-name map not found under {tech_dir}")
+            else:
+                result = parse_klayout_map(map_files[0])
+                if not result:
+                    self._log(f"layer-name map at {map_files[0]} parsed empty")
+        elif pdk_name:
+            self._log(
+                f"no layer-name mapping configured for PDK {pdk_name!r} "
+                "(extend _PDK_LAYER_MAP_VARIANT in start_gui.py)"
+            )
+        self._layer_name_maps[pdk_name] = result
+        return result
+
+    def _on_layer_name_toggle(self, _checked: bool) -> None:
+        if self._last_gds is not None:
+            self._render_preview(self._last_gds)
 
     # ----- DRC ------------------------------------------------------------
     def _on_run_drc(self) -> None:
@@ -1425,7 +1828,14 @@ class PcellMenu(QtWidgets.QMainWindow):
         worker.log.connect(self._log)
         worker.text_out.connect(self._on_text_out)
 
+        # Single in-flight worker at a time -- _on_generate / _on_run_*
+        # already gate on self._busy. Track it so the busy dialog's
+        # Cancel button can call worker.cancel().
+        self._active_worker = worker
+
         def _on_done(success: bool, msg: str):
+            if self._active_worker is worker:
+                self._active_worker = None
             on_finished(success, msg)
             thread.quit()
 
@@ -1450,10 +1860,47 @@ class PcellMenu(QtWidgets.QMainWindow):
         self._busy = busy
         if busy:
             self.gen_btn.setEnabled(False)
+            self._show_busy_dialog(status_text or "working...")
         else:
             self.gen_btn.setEnabled(self._current is not None and bool(self._pdks))
+            self._hide_busy_dialog()
         self._refresh_check_buttons()
         self.status_lbl.setText(status_text)
+
+    # ----- busy spinner ---------------------------------------------------
+    def _show_busy_dialog(self, label: str) -> None:
+        """Pop a non-modal indeterminate-progress dialog so a long
+        DRC/LVS/Generate run is visible and cancellable. Reusing the
+        same dialog instance avoids repeated show/hide flicker."""
+        if not hasattr(self, "_busy_dialog") or self._busy_dialog is None:
+            dlg = QtWidgets.QProgressDialog(label, "Cancel", 0, 0, self)
+            dlg.setWindowTitle("Working...")
+            dlg.setWindowModality(QtCore.Qt.NonModal)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.setMinimumDuration(0)
+            dlg.canceled.connect(self._on_busy_cancel)
+            self._busy_dialog = dlg
+        else:
+            self._busy_dialog.setLabelText(label)
+            self._busy_dialog.reset()  # clear any prior cancel state
+        # reset() above calls cancel(); re-show explicitly.
+        self._busy_dialog.show()
+        self._busy_dialog.raise_()
+
+    def _hide_busy_dialog(self) -> None:
+        if getattr(self, "_busy_dialog", None) is not None:
+            self._busy_dialog.hide()
+
+    def _on_busy_cancel(self) -> None:
+        worker = getattr(self, "_active_worker", None)
+        if worker is None:
+            return
+        self._log("cancel requested")
+        worker.cancel()
+        # Don't clear _busy here -- the worker's finished signal will
+        # arrive with an error verdict, which routes through the normal
+        # _after_check / _after_generation path and clears busy/dialog.
 
     @QtCore.Slot(str)
     def _log(self, msg: str) -> None:

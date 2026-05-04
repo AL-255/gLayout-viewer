@@ -10,12 +10,46 @@ from __future__ import annotations
 
 import colorsys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import gdstk
 from matplotlib.collections import PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
+
+
+def parse_klayout_map(map_path: Path) -> dict[tuple[int, int], str]:
+    """Parse a klayout layer-map file (LEF/DEF style: 4 whitespace-separated
+    columns ``name purpose layer_num datatype``).
+
+    Returns a ``{(layer, datatype): "name"}`` lookup. Lines whose name is
+    ``NAME`` are skipped (those rows describe text-label streams, not the
+    drawing geometry the preview renders), as are blank/comment lines and
+    rows with a non-integer layer/datatype. The first non-NAME entry for a
+    given ``(layer, datatype)`` wins -- subsequent rows usually only
+    re-purpose the same stream for PIN/LEFOBS variants.
+    """
+    out: dict[tuple[int, int], str] = {}
+    try:
+        text = Path(map_path).read_text(errors="replace")
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "//")):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name, _purpose, layer_s, dtype_s = parts[0], parts[1], parts[-2], parts[-1]
+        if name == "NAME":
+            continue
+        try:
+            key = (int(layer_s), int(dtype_s))
+        except ValueError:
+            continue
+        out.setdefault(key, name)
+    return out
 
 
 def _color_for(layer: int, datatype: int) -> tuple[float, float, float]:
@@ -27,7 +61,13 @@ def _color_for(layer: int, datatype: int) -> tuple[float, float, float]:
     return colorsys.hsv_to_rgb(hue, sat, val)
 
 
-def render_gds(gds_path: Path, fig: Figure, *, max_polys_per_layer: int = 4000) -> str:
+def render_gds(
+    gds_path: Path,
+    fig: Figure,
+    *,
+    max_polys_per_layer: int = 4000,
+    layer_names: Mapping[tuple[int, int], str] | None = None,
+) -> str:
     """Render ``gds_path`` into ``fig``. Returns a one-line summary.
 
     The figure is cleared and a single Axes is configured with equal aspect.
@@ -71,7 +111,13 @@ def render_gds(gds_path: Path, fig: Figure, *, max_polys_per_layer: int = 4000) 
             linewidths=0.4,
         )
         ax.add_collection(coll)
-        legend_handles.append(Patch(facecolor=rgb, edgecolor="black", label=f"{layer}/{datatype}"))
+        gds_label = f"{layer}/{datatype}"
+        if layer_names is not None:
+            name = layer_names.get((layer, datatype))
+            label = f"{name} ({gds_label})" if name else gds_label
+        else:
+            label = gds_label
+        legend_handles.append(Patch(facecolor=rgb, edgecolor="black", label=label))
 
     bb = cell.bounding_box()
     if bb is not None:
@@ -87,7 +133,7 @@ def render_gds(gds_path: Path, fig: Figure, *, max_polys_per_layer: int = 4000) 
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
             fontsize=7,
-            title="layer/dt",
+            title="layer" if layer_names else "layer/dt",
             frameon=False,
         )
     fig.tight_layout()
