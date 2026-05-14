@@ -52,7 +52,7 @@ from discovery import (  # noqa: E402
     discover_pdks,
     underlying_types,
 )
-from gds_viewer import render_gds, parse_klayout_map  # noqa: E402
+from gds_viewer import render_gds, parse_klayout_map, LAYER_STYLES, DEFAULT_STYLE  # noqa: E402
 import pdk_check  # noqa: E402
 from themes import THEMES, Theme, get_theme  # noqa: E402
 
@@ -1771,8 +1771,18 @@ class PcellMenu(QtWidgets.QMainWindow):
             tops = lib.top_level()
             if not tops:
                 raise RuntimeError("GDS has no top-level cell")
-            # gdstk defaults to a dark background; force white.
-            tops[0].write_svg(str(out), background="#ffffff")
+            # Build shape_style for layers actually present in the GDS,
+            # using the curated palette shared with docs/render_figures.py.
+            shape_style: dict[tuple[int, int], dict] = {}
+            for cell in lib.cells:
+                for poly in cell.polygons:
+                    key = (poly.layer, poly.datatype)
+                    shape_style.setdefault(key, LAYER_STYLES.get(key, DEFAULT_STYLE))
+                for path in cell.paths:
+                    for layer, datatype in zip(path.layers, path.datatypes):
+                        key = (layer, datatype)
+                        shape_style.setdefault(key, LAYER_STYLES.get(key, DEFAULT_STYLE))
+            tops[0].write_svg(str(out), background="#ffffff", shape_style=shape_style)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Save SVG failed", f"could not write SVG: {exc}",
