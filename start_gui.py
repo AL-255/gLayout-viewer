@@ -952,7 +952,8 @@ class PcellMenu(QtWidgets.QMainWindow):
         th.addWidget(self.preview_show_layer_names, stretch=0)
         self.save_svg_btn = QtWidgets.QPushButton("Save SVG...")
         self.save_svg_btn.setToolTip(
-            "Export the current GDS as an SVG via gdstk"
+            "Export the current GDS as an SVG via gdstk, plus a companion "
+            "PNG of the preview rendering"
         )
         self.save_svg_btn.setEnabled(False)
         self.save_svg_btn.clicked.connect(self._on_save_svg)
@@ -1763,6 +1764,7 @@ class PcellMenu(QtWidgets.QMainWindow):
         out = Path(fname)
         if out.suffix.lower() != ".svg":
             out = out.with_suffix(".svg")
+        png_out = out.with_suffix(".png")
         try:
             import gdstk
             lib = gdstk.read_gds(str(self._last_gds))
@@ -1777,6 +1779,19 @@ class PcellMenu(QtWidgets.QMainWindow):
             self._log(f"!! save SVG failed: {exc}")
             return
         self._log(f"saved SVG: {out}")
+        # Companion PNG: rasterize the current matplotlib preview figure.
+        # This mirrors what the user already sees on screen rather than
+        # rasterizing the gdstk SVG (which would need cairosvg / inkscape).
+        try:
+            self.preview_fig.savefig(str(png_out), dpi=200, bbox_inches="tight")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save PNG failed",
+                f"SVG saved, but PNG companion failed: {exc}",
+            )
+            self._log(f"!! save PNG failed: {exc}")
+            return
+        self._log(f"saved PNG: {png_out}")
 
     def _on_open_klayout(self) -> None:
         """Spawn ``klayout -e <gds>`` with KLAYOUT_PATH pinned at the PDK
