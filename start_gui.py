@@ -950,6 +950,13 @@ class PcellMenu(QtWidgets.QMainWindow):
         )
         self.preview_show_layer_names.toggled.connect(self._on_layer_name_toggle)
         th.addWidget(self.preview_show_layer_names, stretch=0)
+        self.save_svg_btn = QtWidgets.QPushButton("Save SVG...")
+        self.save_svg_btn.setToolTip(
+            "Export the current GDS as an SVG via gdstk"
+        )
+        self.save_svg_btn.setEnabled(False)
+        self.save_svg_btn.clicked.connect(self._on_save_svg)
+        th.addWidget(self.save_svg_btn, stretch=0)
         v.addWidget(toolrow)
 
         v.addWidget(self.preview_canvas, stretch=1)
@@ -1733,12 +1740,43 @@ class PcellMenu(QtWidgets.QMainWindow):
             self.drc_btn.setEnabled(False)
             self.lvs_btn.setEnabled(False)
             self.klayout_btn.setEnabled(False)
+            self.save_svg_btn.setEnabled(False)
             return
         self.drc_btn.setEnabled(self._last_gds is not None)
         self.lvs_btn.setEnabled(
             self._last_gds is not None and self._last_spice is not None
         )
         self.klayout_btn.setEnabled(self._last_gds is not None)
+        self.save_svg_btn.setEnabled(self._last_gds is not None)
+
+    def _on_save_svg(self) -> None:
+        """Export the last-generated GDS as an SVG via gdstk's built-in writer."""
+        if self._last_gds is None:
+            return
+        stem = self._last_design_name or self._last_gds.stem
+        suggested = str(self._last_gds.parent / f"{stem}.svg")
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save SVG", suggested, "SVG files (*.svg);;All files (*)"
+        )
+        if not fname:
+            return
+        out = Path(fname)
+        if out.suffix.lower() != ".svg":
+            out = out.with_suffix(".svg")
+        try:
+            import gdstk
+            lib = gdstk.read_gds(str(self._last_gds))
+            tops = lib.top_level()
+            if not tops:
+                raise RuntimeError("GDS has no top-level cell")
+            tops[0].write_svg(str(out))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Save SVG failed", f"could not write SVG: {exc}",
+            )
+            self._log(f"!! save SVG failed: {exc}")
+            return
+        self._log(f"saved SVG: {out}")
 
     def _on_open_klayout(self) -> None:
         """Spawn ``klayout -e <gds>`` with KLAYOUT_PATH pinned at the PDK
