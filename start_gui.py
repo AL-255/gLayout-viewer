@@ -67,6 +67,15 @@ _LAYOUT_FORMAT_VERSION = 2
 _SENTINEL = object()
 _DEFAULT_THEME = "Fusion light"
 
+# UI scale settings. QT_SCALE_FACTOR is read by QGuiApplication during
+# construction, so the value has to be set in the environment *before* the
+# QApplication exists. The menu therefore writes to QSettings and asks for a
+# restart; main() reads QSettings and applies the env var before constructing
+# the app.
+_UI_SCALE_KEY = "ui_scale"
+_UI_SCALE_SYSTEM = "system"
+_UI_SCALE_PERCENTS: tuple[int, ...] = tuple(range(50, 401, 50))
+
 
 # ---------------------------------------------------------------------------
 # parameter parsing
@@ -1129,6 +1138,30 @@ class PcellMenu(QtWidgets.QMainWindow):
             theme_menu.addAction(action)
             self._theme_actions[theme.name] = action
 
+        scale_menu = view_menu.addMenu("UI Scale")
+        scale_group = QtGui.QActionGroup(self)
+        scale_group.setExclusive(True)
+        current_scale = (
+            self._settings.value(_UI_SCALE_KEY, _UI_SCALE_SYSTEM, type=str)
+            or _UI_SCALE_SYSTEM
+        )
+        sys_action = QtGui.QAction("System default", self, checkable=True)
+        sys_action.setChecked(current_scale == _UI_SCALE_SYSTEM)
+        sys_action.triggered.connect(
+            lambda _checked=False: self._on_ui_scale_chosen(_UI_SCALE_SYSTEM)
+        )
+        scale_group.addAction(sys_action)
+        scale_menu.addAction(sys_action)
+        scale_menu.addSeparator()
+        for pct in _UI_SCALE_PERCENTS:
+            action = QtGui.QAction(f"{pct}%", self, checkable=True)
+            action.setChecked(current_scale == str(pct))
+            action.triggered.connect(
+                lambda _checked=False, p=pct: self._on_ui_scale_chosen(str(p))
+            )
+            scale_group.addAction(action)
+            scale_menu.addAction(action)
+
     def _open_about(self) -> None:
         AboutDialog(self).exec()
 
@@ -1139,6 +1172,36 @@ class PcellMenu(QtWidgets.QMainWindow):
         action = self._theme_actions.get(theme.name)
         if action is not None:
             action.setChecked(True)
+
+    def _on_ui_scale_chosen(self, scale: str) -> None:
+        current = (
+            self._settings.value(_UI_SCALE_KEY, _UI_SCALE_SYSTEM, type=str)
+            or _UI_SCALE_SYSTEM
+        )
+        if scale == current:
+            return
+        self._settings.setValue(_UI_SCALE_KEY, scale)
+        self._settings.sync()
+        ret = QtWidgets.QMessageBox.question(
+            self,
+            "Restart required",
+            "UI scale changes take effect after restarting the application.\n\n"
+            "Restart now?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if ret == QtWidgets.QMessageBox.Yes:
+            self._restart_application()
+
+    def _restart_application(self) -> None:
+        # Re-exec the current interpreter with the same argv so the new
+        # QT_SCALE_FACTOR is picked up during QGuiApplication construction.
+        # Defer until after the menu/event returns so Qt can finish dispatching
+        # the triggering action cleanly.
+        def _do_exec() -> None:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+
+        QtCore.QTimer.singleShot(0, _do_exec)
 
     def _apply_theme(self, theme: Theme) -> None:
         app = QtWidgets.QApplication.instance()
@@ -1911,6 +1974,22 @@ class PcellMenu(QtWidgets.QMainWindow):
         widget.moveCursor(QtGui.QTextCursor.End)
 
 
+def _apply_persisted_ui_scale() -> None:
+    # QSettings can be constructed with explicit org/app before QApplication
+    # exists; QT_SCALE_FACTOR must be in the environment before Qt reads it.
+    s = QtCore.QSettings("glayout", "pcell-menu")
+    raw = s.value(_UI_SCALE_KEY, _UI_SCALE_SYSTEM, type=str) or _UI_SCALE_SYSTEM
+    if raw == _UI_SCALE_SYSTEM:
+        return
+    try:
+        pct = int(raw)
+    except (TypeError, ValueError):
+        return
+    if pct not in _UI_SCALE_PERCENTS:
+        return
+    os.environ["QT_SCALE_FACTOR"] = f"{pct / 100:.2f}"
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     # Be robust on systems where Qt's xcb plugin is fussy.
@@ -1922,6 +2001,7 @@ def main() -> int:
                 os.environ.setdefault("QT_PLUGIN_PATH", str(plugins))
         except Exception:
             pass
+    _apply_persisted_ui_scale()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = PcellMenu()
     win.show()
