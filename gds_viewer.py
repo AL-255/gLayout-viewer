@@ -1,11 +1,13 @@
 """Lightweight GDS viewer: parse with gdstk, render with matplotlib.
 
-Color palette is shared with docs/render_figures.py for visual consistency
-between the interactive preview and exported SVGs/PNGs.
+Color palettes are loaded from JSON files (one per PDK) in the palettes/
+directory for visual consistency between the interactive preview and exported
+SVGs/PNGs.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -16,86 +18,35 @@ from matplotlib.patches import Patch
 
 
 # ---------------------------------------------------------------------------
-# Curated soft palette per (layer, datatype) — synced with docs/render_figures.py
+# Layer palettes — loaded from palettes/*.json at import time
 # ---------------------------------------------------------------------------
 
-LAYER_STYLES: dict[tuple[int, int], dict] = {
-    # ---- gf180mcuC ----------------------------------------------------------
-    (12, 0):  {"fill": "#e6f7ff", "stroke": "#7fb8d4", "stroke-width": "1", "fill-opacity": "0.30"},
-    (21, 0):  {"fill": "#fff5cc", "stroke": "#c9a227", "stroke-width": "1", "fill-opacity": "0.30"},
-    (204, 0): {"fill": "#f0f0f0", "stroke": "#888888", "stroke-width": "1", "fill-opacity": "0.30"},
-    (22, 0):  {"fill": "#e2d5f0", "stroke": "#6b4c93", "stroke-width": "1", "fill-opacity": "0.55"},
-    (31, 0):  {"fill": "#cfe8e0", "stroke": "#2f7a6a", "stroke-width": "1", "fill-opacity": "0.45"},
-    (32, 0):  {"fill": "#e8e0c8", "stroke": "#8a7a2e", "stroke-width": "1", "fill-opacity": "0.45"},
-    (30, 0):  {"fill": "#ffd1d1", "stroke": "#c0392b", "stroke-width": "1", "fill-opacity": "0.65"},
-    (33, 0):  {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
-    (34, 0):  {"fill": "#cfe2ff", "stroke": "#3f7fbf", "stroke-width": "1", "fill-opacity": "0.55"},
-    (36, 0):  {"fill": "#d4f0d0", "stroke": "#3f9f4f", "stroke-width": "1", "fill-opacity": "0.55"},
-    (42, 0):  {"fill": "#fff2b3", "stroke": "#bfa022", "stroke-width": "1", "fill-opacity": "0.55"},
-    (46, 0):  {"fill": "#ffd9b3", "stroke": "#cf7f2a", "stroke-width": "1", "fill-opacity": "0.55"},
-    (81, 0):  {"fill": "#ffd1e6", "stroke": "#c0398a", "stroke-width": "1", "fill-opacity": "0.55"},
-    (35, 0):  {"fill": "#3f7fbf", "stroke": "#1f3f7f", "stroke-width": "1", "fill-opacity": "0.85"},
-    (38, 0):  {"fill": "#3f9f4f", "stroke": "#1f5f2f", "stroke-width": "1", "fill-opacity": "0.85"},
-    (40, 0):  {"fill": "#bfa022", "stroke": "#7f6f10", "stroke-width": "1", "fill-opacity": "0.85"},
-    (41, 0):  {"fill": "#cf7f2a", "stroke": "#7f4f10", "stroke-width": "1", "fill-opacity": "0.85"},
-    (117, 5): {"fill": "#f0c8f0", "stroke": "#9f3f9f", "stroke-width": "1", "fill-opacity": "0.40"},
-    (127, 5): {"fill": "#ffe0c8", "stroke": "#bf6f1f", "stroke-width": "1", "fill-opacity": "0.30"},
-    (118, 5): {"fill": "#c8e0ff", "stroke": "#1f6fbf", "stroke-width": "1", "fill-opacity": "0.30"},
-    # ---- sky130 -------------------------------------------------------------
-    (64, 18): {"fill": "#e6f7ff", "stroke": "#7fb8d4", "stroke-width": "1", "fill-opacity": "0.30"},
-    (64, 20): {"fill": "#fff5cc", "stroke": "#c9a227", "stroke-width": "1", "fill-opacity": "0.30"},
-    (64, 44): {"fill": "#f0f0f0", "stroke": "#888888", "stroke-width": "1", "fill-opacity": "0.30"},
-    (65, 20): {"fill": "#e2d5f0", "stroke": "#6b4c93", "stroke-width": "1", "fill-opacity": "0.55"},
-    (65, 44): {"fill": "#d8c8ec", "stroke": "#5b3c83", "stroke-width": "1", "fill-opacity": "0.55"},
-    (93, 44): {"fill": "#e8e0c8", "stroke": "#8a7a2e", "stroke-width": "1", "fill-opacity": "0.45"},
-    (94, 20): {"fill": "#cfe8e0", "stroke": "#2f7a6a", "stroke-width": "1", "fill-opacity": "0.45"},
-    (66, 20): {"fill": "#ffd1d1", "stroke": "#c0392b", "stroke-width": "1", "fill-opacity": "0.65"},
-    (66, 44): {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
-    (67, 44): {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
-    (67, 20): {"fill": "#ffe9b8", "stroke": "#bf8b22", "stroke-width": "1", "fill-opacity": "0.55"},
-    (68, 20): {"fill": "#cfe2ff", "stroke": "#3f7fbf", "stroke-width": "1", "fill-opacity": "0.55"},
-    (68, 44): {"fill": "#3f7fbf", "stroke": "#1f3f7f", "stroke-width": "1", "fill-opacity": "0.85"},
-    (69, 20): {"fill": "#d4f0d0", "stroke": "#3f9f4f", "stroke-width": "1", "fill-opacity": "0.55"},
-    (69, 44): {"fill": "#3f9f4f", "stroke": "#1f5f2f", "stroke-width": "1", "fill-opacity": "0.85"},
-    (70, 20): {"fill": "#fff2b3", "stroke": "#bfa022", "stroke-width": "1", "fill-opacity": "0.55"},
-    (70, 44): {"fill": "#bfa022", "stroke": "#7f6f10", "stroke-width": "1", "fill-opacity": "0.85"},
-    (71, 20): {"fill": "#ffd9b3", "stroke": "#cf7f2a", "stroke-width": "1", "fill-opacity": "0.55"},
-    (89, 44): {"fill": "#f0c8f0", "stroke": "#9f3f9f", "stroke-width": "1", "fill-opacity": "0.40"},
-    (95, 20): {"fill": "#e8d8c0", "stroke": "#8a6a3e", "stroke-width": "1", "fill-opacity": "0.30"},
-    # ---- ihp130 --------------------------------------------------------------
-    # wells
-    (31, 0):  {"fill": "#fff5cc", "stroke": "#c9a227", "stroke-width": "1", "fill-opacity": "0.30"},   # ihp130 nwell
-    (46, 0):  {"fill": "#f0f0f0", "stroke": "#888888", "stroke-width": "1", "fill-opacity": "0.30"},   # ihp130 pwell
-    # active / implants
-    (1, 0):   {"fill": "#e2d5f0", "stroke": "#6b4c93", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 activ
-    (7, 0):   {"fill": "#e8e0c8", "stroke": "#8a7a2e", "stroke-width": "1", "fill-opacity": "0.45"},   # ihp130 nsd (n+)
-    (14, 0):  {"fill": "#cfe8e0", "stroke": "#2f7a6a", "stroke-width": "1", "fill-opacity": "0.45"},   # ihp130 psd (p+)
-    # poly + contact
-    (5, 0):   {"fill": "#ffd1d1", "stroke": "#c0392b", "stroke-width": "1", "fill-opacity": "0.65"},   # ihp130 gatpoly
-    (6, 0):   {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"}, # ihp130 cont
-    # metal stack — cool->warm by level
-    (8, 0):   {"fill": "#cfe2ff", "stroke": "#3f7fbf", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 metal1
-    (10, 0):  {"fill": "#d4f0d0", "stroke": "#3f9f4f", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 metal2
-    (30, 0):  {"fill": "#fff2b3", "stroke": "#bfa022", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 metal3
-    (50, 0):  {"fill": "#ffd9b3", "stroke": "#cf7f2a", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 metal4
-    (67, 0):  {"fill": "#ffd1e6", "stroke": "#c0398a", "stroke-width": "1", "fill-opacity": "0.55"},   # ihp130 metal5
-    # vias
-    (19, 0):  {"fill": "#3f7fbf", "stroke": "#1f3f7f", "stroke-width": "1", "fill-opacity": "0.85"},   # ihp130 via1
-    (29, 0):  {"fill": "#3f9f4f", "stroke": "#1f5f2f", "stroke-width": "1", "fill-opacity": "0.85"},   # ihp130 via2
-    (49, 0):  {"fill": "#bfa022", "stroke": "#7f6f10", "stroke-width": "1", "fill-opacity": "0.85"},   # ihp130 via3
-    (66, 0):  {"fill": "#cf7f2a", "stroke": "#7f4f10", "stroke-width": "1", "fill-opacity": "0.85"},   # ihp130 via4
-    # mim cap
-    (36, 0):  {"fill": "#f0c8f0", "stroke": "#9f3f9f", "stroke-width": "1", "fill-opacity": "0.40"},   # ihp130 mim
-    (70, 20): {"fill": "#e8d8f4", "stroke": "#7f5fa7", "stroke-width": "1", "fill-opacity": "0.30"},   # ihp130 capmetbottom
-    (71, 20): {"fill": "#f0d8e8", "stroke": "#a75f7f", "stroke-width": "1", "fill-opacity": "0.30"},   # ihp130 capmettop
-}
+_PALETTES_DIR = Path(__file__).resolve().parent / "palettes"
 
-DEFAULT_STYLE = {
-    "fill": "#dddddd",
-    "stroke": "#666666",
-    "stroke-width": "1",
-    "fill-opacity": "0.40",
-}
+
+def _load_palettes() -> tuple[dict[tuple[int, int], dict], dict]:
+    layers: dict[tuple[int, int], dict] = {}
+    default: dict = {"fill": "#dddddd", "stroke": "#666666", "stroke-width": "1", "fill-opacity": "0.40"}
+
+    default_path = _PALETTES_DIR / "default.json"
+    if default_path.exists():
+        with open(default_path) as f:
+            data = json.load(f)
+            default = data.get("default", default)
+
+    for p in sorted(_PALETTES_DIR.glob("*.json")):
+        if p.name == "default.json":
+            continue
+        with open(p) as f:
+            data = json.load(f)
+            for key_str, style in data.get("layers", {}).items():
+                l, d = key_str.split("/")
+                layers[(int(l), int(d))] = style
+
+    return layers, default
+
+
+LAYER_STYLES, DEFAULT_STYLE = _load_palettes()
 
 
 def parse_klayout_map(map_path: Path) -> dict[tuple[int, int], str]:

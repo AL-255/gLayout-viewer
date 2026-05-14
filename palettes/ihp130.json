@@ -1,0 +1,23 @@
+{
+  "layers": {
+    "1/0":  {"fill": "#e2d5f0", "stroke": "#6b4c93", "stroke-width": "1", "fill-opacity": "0.55"},
+    "5/0":  {"fill": "#ffd1d1", "stroke": "#c0392b", "stroke-width": "1", "fill-opacity": "0.65"},
+    "6/0":  {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
+    "7/0":  {"fill": "#e8e0c8", "stroke": "#8a7a2e", "stroke-width": "1", "fill-opacity": "0.45"},
+    "8/0":  {"fill": "#cfe2ff", "stroke": "#3f7fbf", "stroke-width": "1", "fill-opacity": "0.55"},
+    "10/0": {"fill": "#d4f0d0", "stroke": "#3f9f4f", "stroke-width": "1", "fill-opacity": "0.55"},
+    "14/0": {"fill": "#cfe8e0", "stroke": "#2f7a6a", "stroke-width": "1", "fill-opacity": "0.45"},
+    "19/0": {"fill": "#3f7fbf", "stroke": "#1f3f7f", "stroke-width": "1", "fill-opacity": "0.85"},
+    "29/0": {"fill": "#3f9f4f", "stroke": "#1f5f2f", "stroke-width": "1", "fill-opacity": "0.85"},
+    "30/0": {"fill": "#fff2b3", "stroke": "#bfa022", "stroke-width": "1", "fill-opacity": "0.55"},
+    "31/0": {"fill": "#fff5cc", "stroke": "#c9a227", "stroke-width": "1", "fill-opacity": "0.30"},
+    "36/0": {"fill": "#f0c8f0", "stroke": "#9f3f9f", "stroke-width": "1", "fill-opacity": "0.40"},
+    "46/0": {"fill": "#f0f0f0", "stroke": "#888888", "stroke-width": "1", "fill-opacity": "0.30"},
+    "49/0": {"fill": "#bfa022", "stroke": "#7f6f10", "stroke-width": "1", "fill-opacity": "0.85"},
+    "50/0": {"fill": "#ffd9b3", "stroke": "#cf7f2a", "stroke-width": "1", "fill-opacity": "0.55"},
+    "66/0": {"fill": "#cf7f2a", "stroke": "#7f4f10", "stroke-width": "1", "fill-opacity": "0.85"},
+    "67/0": {"fill": "#ffd1e6", "stroke": "#c0398a", "stroke-width": "1", "fill-opacity": "0.55"},
+    "70/20":{"fill": "#e8d8f4", "stroke": "#7f5fa7", "stroke-width": "1", "fill-opacity": "0.30"},
+    "71/20":{"fill": "#f0d8e8", "stroke": "#a75f7f", "stroke-width": "1", "fill-opacity": "0.30"}
+  }
+}

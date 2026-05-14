@@ -1,0 +1,8 @@
+{
+  "default": {
+    "fill": "#dddddd",
+    "stroke": "#666666",
+    "stroke-width": "1",
+    "fill-opacity": "0.40"
+  }
+}

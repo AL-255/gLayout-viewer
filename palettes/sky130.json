@@ -1,0 +1,24 @@
+{
+  "layers": {
+    "64/18": {"fill": "#e6f7ff", "stroke": "#7fb8d4", "stroke-width": "1", "fill-opacity": "0.30"},
+    "64/20": {"fill": "#fff5cc", "stroke": "#c9a227", "stroke-width": "1", "fill-opacity": "0.30"},
+    "64/44": {"fill": "#f0f0f0", "stroke": "#888888", "stroke-width": "1", "fill-opacity": "0.30"},
+    "65/20": {"fill": "#e2d5f0", "stroke": "#6b4c93", "stroke-width": "1", "fill-opacity": "0.55"},
+    "65/44": {"fill": "#d8c8ec", "stroke": "#5b3c83", "stroke-width": "1", "fill-opacity": "0.55"},
+    "93/44": {"fill": "#e8e0c8", "stroke": "#8a7a2e", "stroke-width": "1", "fill-opacity": "0.45"},
+    "94/20": {"fill": "#cfe8e0", "stroke": "#2f7a6a", "stroke-width": "1", "fill-opacity": "0.45"},
+    "66/20": {"fill": "#ffd1d1", "stroke": "#c0392b", "stroke-width": "1", "fill-opacity": "0.65"},
+    "66/44": {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
+    "67/44": {"fill": "#888888", "stroke": "#555555", "stroke-width": "0.5", "fill-opacity": "0.75"},
+    "67/20": {"fill": "#ffe9b8", "stroke": "#bf8b22", "stroke-width": "1", "fill-opacity": "0.55"},
+    "68/20": {"fill": "#cfe2ff", "stroke": "#3f7fbf", "stroke-width": "1", "fill-opacity": "0.55"},
+    "68/44": {"fill": "#3f7fbf", "stroke": "#1f3f7f", "stroke-width": "1", "fill-opacity": "0.85"},
+    "69/20": {"fill": "#d4f0d0", "stroke": "#3f9f4f", "stroke-width": "1", "fill-opacity": "0.55"},
+    "69/44": {"fill": "#3f9f4f", "stroke": "#1f5f2f", "stroke-width": "1", "fill-opacity": "0.85"},
+    "70/20": {"fill": "#fff2b3", "stroke": "#bfa022", "stroke-width": "1", "fill-opacity": "0.55"},
+    "70/44": {"fill": "#bfa022", "stroke": "#7f6f10", "stroke-width": "1", "fill-opacity": "0.85"},
+    "71/20": {"fill": "#ffd9b3", "stroke": "#cf7f2a", "stroke-width": "1", "fill-opacity": "0.55"},
+    "89/44": {"fill": "#f0c8f0", "stroke": "#9f3f9f", "stroke-width": "1", "fill-opacity": "0.40"},
+    "95/20": {"fill": "#e8d8c0", "stroke": "#8a6a3e", "stroke-width": "1", "fill-opacity": "0.30"}
+  }
+}
