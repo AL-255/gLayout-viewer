@@ -1771,7 +1771,8 @@ class PcellMenu(QtWidgets.QMainWindow):
             tops = lib.top_level()
             if not tops:
                 raise RuntimeError("GDS has no top-level cell")
-            tops[0].write_svg(str(out))
+            # gdstk defaults to a dark background; force white.
+            tops[0].write_svg(str(out), background="#ffffff")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Save SVG failed", f"could not write SVG: {exc}",
@@ -1779,11 +1780,31 @@ class PcellMenu(QtWidgets.QMainWindow):
             self._log(f"!! save SVG failed: {exc}")
             return
         self._log(f"saved SVG: {out}")
-        # Companion PNG: rasterize the current matplotlib preview figure.
-        # This mirrors what the user already sees on screen rather than
-        # rasterizing the gdstk SVG (which would need cairosvg / inkscape).
+        # Companion PNG: rasterize the SVG we just wrote using QtSvg so the
+        # PNG and SVG are byte-for-byte the same artwork (no matplotlib
+        # re-render, no separate styling).
         try:
-            self.preview_fig.savefig(str(png_out), dpi=200, bbox_inches="tight")
+            from PySide6 import QtSvg
+            renderer = QtSvg.QSvgRenderer(str(out))
+            if not renderer.isValid():
+                raise RuntimeError("QSvgRenderer rejected the SVG")
+            size = renderer.defaultSize()
+            if size.width() <= 0 or size.height() <= 0:
+                raise RuntimeError("SVG has no intrinsic size")
+            # 2x upscale keeps text/lines crisp without ballooning file size.
+            scale = 2
+            img = QtGui.QImage(
+                size.width() * scale, size.height() * scale,
+                QtGui.QImage.Format_ARGB32,
+            )
+            img.fill(QtCore.Qt.white)
+            painter = QtGui.QPainter(img)
+            try:
+                renderer.render(painter)
+            finally:
+                painter.end()
+            if not img.save(str(png_out), "PNG"):
+                raise RuntimeError(f"QImage.save returned False for {png_out}")
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
                 self, "Save PNG failed",
